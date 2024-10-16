@@ -1,5 +1,7 @@
 import streamlit as st
-import os
+import plotly.express as px
+import plotly.graph_objects as go
+import io
 import openai
 import chromadb
 import pandas as pd
@@ -14,6 +16,9 @@ from pymongo.mongo_client import MongoClient
 from pymongo.server_api import ServerApi
 from bson import ObjectId
 import logging
+from pandas import json_normalize
+import json2table
+from flatten_json import flatten
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -33,7 +38,7 @@ def get_mongodb_connection():
         return None
 
 # Placeholder for OpenAI API Key
-OPENAI_API_KEY = "openai api"
+OPENAI_API_KEY = "opwnai key"
 openai.api_key = OPENAI_API_KEY
 
 # ChromaDB setup
@@ -257,12 +262,17 @@ def edit_mongodb_document():
                 
                 # Display the modified JSON
                 st.subheader("Modified JSON:")
-                st.json(modified_json)
+                st.write(modified_json)
 
                 # Confirm changes
                 if st.button("Confirm and Update MongoDB"):
+                    # Remove the triple backticks from the modified JSON
+                    modified_json = modified_json.replace("```json", "").strip("'''").strip('"""')
+                    if modified_json.endswith('```'):
+                        modified_json = modified_json[:-3]
+
                     # Update document
-                    update_result = update_mongodb_document(str(selected_doc['_id']), modified_json)
+                    update_result = update_mongodb_document(str(selected_doc['_id']), json.loads(modified_json))
                     if update_result:
                         st.success("Document updated successfully!")
                         st.experimental_rerun()
@@ -304,40 +314,6 @@ def generate_modified_json(document, user_input):
         logger.error(f"Error in generate_modified_json: {str(e)}", exc_info=True)
         raise
 
-def delete_mongodb_document(document_id):
-    client = get_mongodb_connection()
-    if client:
-        try:
-            db = client.enterrag_db
-            collection = db.pdf_data
-            result = collection.delete_one({'_id': ObjectId(document_id)})
-            return result.deleted_count
-        except Exception as e:
-            st.error(f"Error deleting from MongoDB: {str(e)}")
-            return 0
-        finally:
-            client.close()
-    else:
-        return 0
-
-def insert_mongodb_document(document):
-    client = get_mongodb_connection()
-    if client:
-        try:
-            db = client.enterrag_db
-            collection = db.pdf_data
-            if '_id' in document:
-                del document['_id']  # Remove _id if present to let MongoDB generate a new one
-            result = collection.insert_one(document)
-            return result.inserted_id
-        except Exception as e:
-            st.error(f"Error inserting into MongoDB: {str(e)}")
-            return None
-        finally:
-            client.close()
-    else:
-        return None
-
 def generate_edit_command(document, user_input):
     prompt = f"""
     Given the following MongoDB document:
@@ -373,7 +349,10 @@ def update_mongodb_document(document_id, updated_document):
             if '_id' in updated_document:
                 del updated_document['_id']
             
-            result = collection.replace_one({'_id': ObjectId(document_id)}, updated_document)
+            result = collection.update_one(
+                {'_id': ObjectId(document_id)},
+                {'$set': updated_document}
+            )
             logger.info(f"MongoDB update result: {result.modified_count} document(s) modified")
             return result.modified_count > 0
         except Exception as e:
@@ -493,6 +472,258 @@ def pdf_to_mongodb_page():
                 else:
                     st.info("No data to display from MongoDB.")
 
+def db_image_page():
+    st.header("MongoDB Document Viewer")
+
+    # Fetch data from MongoDB
+    data = fetch_mongodb_data()
+
+    if not data:
+        st.info("No data available in MongoDB.")
+        return
+
+    # Create a list of document IDs
+    document_ids = [f"Document {i + 1}" for i in range(len(data))]
+
+    # Create a document selector
+    selected_document = st.selectbox("Select a document to view:", document_ids)
+
+    # Get the index of the selected document
+    selected_index = document_ids.index(selected_document)
+
+    # Display the selected document
+    st.subheader(selected_document)
+
+    # Check if the 'raw_content' key exists
+    if 'raw_content' in data[selected_index]:
+        # Get the JSON string
+        json_string = data[selected_index]['raw_content'].replace("```json", "").strip("'''").strip('"""')
+
+        # Remove the triple backticks at the end of the JSON string
+        if json_string.endswith('```'):
+            json_string = json_string[:-3]
+
+        # Try to parse the JSON string
+        try:
+            json_data = json.loads(json_string)
+            st.success("JSON string parsed successfully:")
+            
+            # Convert the JSON data to a table
+            table = json2table.convert(json_data)
+
+            # Display the table in Streamlit
+            st.write(table, unsafe_allow_html=True)
+
+        except json.JSONDecodeError as e:
+            # If the JSON string is not valid, display an error message
+            st.error(f"Invalid JSON string: {e}")
+            st.write("JSON string that failed to parse:")
+            st.code(json_string)  # Display the JSON string in a code block for better visibility
+
+    else:
+        # If the 'raw_content' key does not exist, display the document as is
+        st.json(data[selected_index])
+
+    # Add a horizontal line to separate documents
+    st.markdown("---")
+
+# Business Thingy
+def flatten_dict(d, parent_key='', sep='_'):
+    items = []
+    for k, v in d.items():
+        new_key = f"{parent_key}{sep}{k}" if parent_key else k
+        if isinstance(v, dict):
+            items.extend(flatten_dict(v, new_key, sep=sep).items())
+        else:
+            items.append((new_key, v))
+    return dict(items)
+
+def extract_text_from_pdf(file):
+    pdf_reader = PyPDF2.PdfReader(file)
+    text = ""
+    for page in pdf_reader.pages:
+        text += page.extract_text()
+    return text
+
+def parse_financial_data(text):
+    prompt = f"""
+    Extract the following financial information from the given text:
+    - Total revenue (in dollars)
+    - Revenue growth (percentage)
+    - Operating profit (in dollars)
+    - Operating margin (percentage)
+    - Net income (in dollars)
+    - Earnings per share (EPS) (in dollars)
+    - Operating cash flow (in dollars)
+    - Revenue breakdown: Provide a detailed breakdown of revenue by all available categories, segments, or product lines. Include ALL subcategories mentioned in the report.
+
+    Text: {text}
+
+    Provide the output as a JSON object with appropriate keys and values. 
+    If you can't find a specific piece of information, use null for its value.
+
+    IMPORTANT: 
+    1. For all monetary values (revenue, profit, income, cash flow):
+       - If the report states the values are in millions or billions, convert them to the full number.
+       - For example, if it says "$70.01 billion", the value should be 70010000000.
+       - If it says "$80.46 million", the value should be 80460000.
+    2. Ensure all monetary values are in whole numbers (no decimals).
+    3. Percentages should be in decimal form (e.g., 15% should be 15, not 0.15).
+    4. For the revenue breakdown:
+       - Include ALL categories and subcategories mentioned in the report.
+       - This might include terms like "Family of Apps", "Reality Labs", "Advertising", "Other revenue", etc.
+       - Provide this as a nested dictionary if there are subcategories.
+       - Use the same scale as the total revenue.
+    5. The EPS should be in dollars and cents (e.g., 4.88 for $4.88 per share).
+    6. If operating profit is not explicitly stated, it may be referred to as "Income from operations" or similar terms.
+
+    Be extremely thorough in extracting all revenue categories and subcategories. Do not omit any breakdown information provided in the report.
+
+    Reply with the JSON object only. Don't give any explanations or comments. Just provide the structured JSON data.
+    """
+
+    try:
+        response = openai.chat.completions.create(
+            model="gpt-4o-mini-2024-07-18",
+            messages=[
+                {"role": "system", "content": "You are a highly skilled financial analyst AI that extracts and structures financial data accurately and comprehensively."},
+                {"role": "user", "content": prompt}
+            ]
+        )
+
+        content = response.choices[0].message.content
+
+        # Remove markdown formatting if present
+        content = content.replace("```json", "").replace("```", "").strip()
+
+        # Parse the JSON
+        data = json.loads(content)
+
+        # Ensure all required keys are present
+        required_keys = [
+            'total_revenue', 'revenue_growth', 'operating_profit', 'operating_margin',
+            'net_income', 'earnings_per_share', 'operating_cash_flow', 'revenue_breakdown'
+        ]
+        for key in required_keys:
+            if key not in data:
+                data[key] = None
+
+        return data
+
+    except json.JSONDecodeError as e:
+        st.error(f"Failed to parse the AI response. JSON error: {str(e)}")
+        st.text("Raw AI response:")
+        st.code(content)
+    except Exception as e:
+        st.error(f"An unexpected error occurred: {str(e)}")
+
+    return None
+
+def format_large_number(num):
+    if num is None:
+        return "N/A"
+    if abs(num) >= 1e9:
+        return f"${num/1e9:.2f}B"
+    elif abs(num) >= 1e6:
+        return f"${num/1e6:.2f}M"
+    elif abs(num) >= 1e3:
+        return f"${num/1e3:.2f}K"
+    else:
+        return f"${num:,.2f}"
+
+def business_metrics_dashboard():
+    st.title("Strategic Financial Intelligence Hub")
+
+    uploaded_file = st.file_uploader("Upload your quarterly financial report (PDF)", type=["pdf"])
+    
+    if uploaded_file is not None:
+        with st.spinner(" Processing the PDF..."):
+            text = extract_text_from_pdf(uploaded_file)
+            financial_data = parse_financial_data(text)
+        
+        if financial_data:
+            # Display key metrics
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                st.metric(
+                    label="Total Revenue",
+                    value=format_large_number(financial_data['total_revenue']),
+                    delta=f"{financial_data['revenue_growth']}% YoY" if financial_data['revenue_growth'] is not None else None
+                )
+    
+            with col2:
+                st.metric(
+                    label="Operating Profit",
+                    value=format_large_number(financial_data['operating_profit']),
+                    delta=f"Margin: {financial_data['operating_margin']}%" if financial_data['operating_margin'] is not None else None
+                )
+    
+            with col3:
+                st.metric(
+                    label="Net Income",
+                    value=format_large_number(financial_data['net_income']),
+                    delta=f"EPS: ${financial_data['earnings_per_share']:.2f}" if financial_data['earnings_per_share'] is not None else "No EPS available."
+                )
+    
+            with col4: st.metric(
+                    label="Operating Cash Flow",
+                    value=format_large_number(financial_data['operating_cash_flow']),
+                    delta=f"{financial_data['operating_cash_flow']/financial_data['total_revenue']*100:.1f}% of Rev" if financial_data['operating_cash_flow'] is not None and financial_data['total_revenue'] is not None else None
+                )
+
+            # Create pie chart for revenue breakdown
+            st.subheader("Revenue Breakdown by Segments")
+            if financial_data['revenue_breakdown']:
+                flattened_breakdown = flatten_dict(financial_data['revenue_breakdown'])
+                fig = px.pie(
+                    values=list(flattened_breakdown.values()),
+                    names=list(flattened_breakdown.keys()),
+                    title='Revenue by Segment'
+                )
+                fig.update_traces(textposition='inside', textinfo='percent+label')
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("No revenue breakdown data available.")
+
+            st.subheader("Earnings Per Share (EPS)")
+            if financial_data['earnings_per_share'] is not None:
+                fig_eps = go.Figure(go.Indicator(
+                    mode = "gauge+number",
+                    value = financial_data['earnings_per_share'],
+                    number = {'prefix': "$"},
+                    title = {"text": "Earnings Per Share"}
+                ))
+                st.plotly_chart(fig_eps, use_container_width=True)
+            else:
+                st.info("No EPS available.")
+
+            st.subheader("Key Financial Metrics")
+            if financial_data['total_revenue'] is not None and financial_data['operating_profit'] is not None and financial_data['net_income'] is not None:
+                fig_metrics = go.Figure(data=[
+                    go.Bar(name='Total Revenue', x=['Total'], y=[financial_data['total_revenue']]),
+                    go.Bar(name='Operating Profit', x=['Total'], y=[financial_data['operating_profit']]),
+                    go.Bar(name='Net Income', x=['Total'], y=[financial_data['net_income']])
+                ])
+                fig_metrics.update_layout(barmode='group', title='Key Financial Metrics')
+                st.plotly_chart(fig_metrics, use_container_width=True)
+            else:
+                st.info("No key financial metrics available.")
+
+        else:
+            st.error("Failed to extract financial data from the uploaded report.")
+
+    else:
+        st.info("Please upload a quarterly financial report (PDF) to view the dashboard.")
+
+def create_dataframe(data):
+    yearly_data = data.get('yearly_data', {})
+    df = pd.DataFrame(yearly_data)
+    df['Date'] = df.index
+    # Ensure column names are consistent
+    df.columns = [col.lower().replace(' ', '_') for col in df.columns]
+    return df
+
 # Main App
 def main():
     # --- PAGE CONFIGURATION ---
@@ -543,10 +774,14 @@ def main():
             st.session_state.page = "AI Chatbot"
         if st.button("Manage Collections"):
             st.session_state.page = "Manage Collections"
-        if st.button("Convert to MongoDB"):
-            st.session_state.page = "Convert to MongoDB"
+        if st.button("Store PDF to MongoDB"):
+            st.session_state.page = "Store PDF to MongoDB"
         if st.button("Audit Data on MongoDB"):
             st.session_state.page = "Audit Data on MongoDB"
+        if st.button("View MongoDB Documents"):
+            st.session_state.page = "View MongoDB Documents"
+        if st.button("Strategic Financial Intelligence Hub"):
+            st.session_state.page = "Strategic Financial Intelligence Hub"
 
     if selected == "About":
         with st.expander("What technologies power this application?"):
@@ -682,7 +917,7 @@ def main():
 
         manage_collections()
 
-    elif st.session_state.page == "Convert to MongoDB":
+    elif st.session_state.page == "Store PDF to MongoDB":
         if selected == "Info":
             with st.expander("What is this page?"):
                 st.markdown('''
@@ -724,6 +959,41 @@ By combining the power of MongoDB for data storage with AI-assisted editing, we 
 Remember to review any AI-generated changes carefully before applying them to ensure they match your intended modifications.
         ''')
         edit_mongodb_document()
+
+    elif st.session_state.page == "View MongoDB Documents":
+        if selected == "Info":
+            with st.expander("What is this page?"):
+                st.markdown('''
+This page displays the documents stored in MongoDB as tables. 
+Each document is presented in a tabular format for easy viewing, 
+with an option to see the raw JSON data. 
+Use this page to quickly review and verify the structured data 
+extracted from your PDF documents.
+''')
+        db_image_page()
+    
+    elif st.session_state.page == "Strategic Financial Intelligence Hub":
+        if selected == "Info":
+            with st.expander("What is this page?"):
+                st.markdown('''
+    This page provides a comprehensive Strategic Financial Intelligence Hub. Here's what you can do:
+
+    1. **Upload Financial Reports**: You can upload PDF files containing financial reports.
+    2. **View Key Metrics**: The dashboard displays four key financial metrics:
+       - Total Revenue with year-over-year growth
+       - Operating Profit with Operating Margin
+       - Net Income with Earnings Per Share (EPS)
+       - Key Business Segment Revenue with growth percentage
+    3. **Interactive Graphs**: The page generates interactive graphs based on the uploaded data, including:
+       - Revenue Trends
+       - Profit Margins
+       - Segment Performance
+       - Earnings Per Share (EPS) Trend
+    4. **AI-Powered Analysis**: The dashboard uses OpenAI's API to extract and structure financial data from the uploaded PDFs.
+
+    This dashboard helps you quickly visualize and understand key financial metrics and trends from your company's reports.
+    ''')
+        business_metrics_dashboard()
 
 if __name__ == "__main__":
     main()
